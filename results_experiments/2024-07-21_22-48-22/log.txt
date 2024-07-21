@@ -1,0 +1,8 @@
+INFO:root:Run ID: 2024-07-21_22-48-22
+INFO:root:Model: CifarResNet
+INFO:root: ----- Initial Model: -----
+INFO:root:Number of MACs = 41.407 M
+INFO:root:Number of Parameters = 0.272 M
+INFO:root:Accuracy = 92.60 %
+INFO:root:Loss = 0.282
+INFO:root: ---------------------------

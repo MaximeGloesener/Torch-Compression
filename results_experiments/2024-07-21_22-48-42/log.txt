@@ -1,0 +1,22 @@
+INFO:root:Run ID: 2024-07-21_22-48-42
+INFO:root:Model: CifarResNet
+INFO:root: ----- Initial Model: -----
+INFO:root:Number of MACs = 41.407 M
+INFO:root:Number of Parameters = 0.272 M
+INFO:root:Accuracy = 92.60 %
+INFO:root:Loss = 0.282
+INFO:root: ---------------------------
+INFO:root:----- Pruning -----
+INFO:root:----- Fine tuning with KD -----
+INFO:root:KD - Epoch 1/3 | Val acc: 37.09 | Val loss: 2.6609 | LR: 0.100000
+INFO:root:KD - Epoch 2/3 | Val acc: 55.58 | Val loss: 1.9714 | LR: 0.075000
+INFO:root:KD - Epoch 3/3 | Val acc: 63.18 | Val loss: 1.6947 | LR: 0.025000
+INFO:root:Best val acc after KD: 63.18
+INFO:root:----- Results after fine tuning -----
+INFO:root:Number of Parameters: 0.27 M => 0.14 M
+INFO:root:MACs: 41.41 M => 19.44 M
+INFO:root:Accuracy: 92.60 % => 63.18 %
+INFO:root:Loss: 0.28 => 1.69
+INFO:root:----- Quantization -----
+INFO:root:Final Compression Ratio: 2.01
+INFO:root:Bit width: 32
