@@ -10,20 +10,10 @@ This project implements a comprehensive model optimization pipeline that include
 - Flexible optimization targets (compression ratio or speed-up)
 - Logging and experiment tracking with wandb
 
-## Requirements
-
-- Python 3.7+
-- PyTorch
-- torch_pruning
-- TensorRT
-- torch2trt
-- wandb (optional, for experiment tracking)
-
-## Installation 
-You can use this colab notebook to experiment with the optimization pipeline or clone this repository. 
-
 
 ## Usage
+
+You can use this colab notebook to try: [▶️ Example](https://colab.research.google.com/drive/1D9QxTZ4PcTbvc90nnfyVujgsEcGKfP_f?usp=sharing)
 
 The main functions to use are
 - `apply_pruning_and_kd`
@@ -60,5 +50,3 @@ optimized_model = optimize(
  wandb_project="my_optimization_project"
 )
 ```
-
-For a working example you can try this colab notebook: [▶️ Start for free](https://colab.research.google.com/drive/1D9QxTZ4PcTbvc90nnfyVujgsEcGKfP_f?usp=sharing)
