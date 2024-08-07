@@ -2,34 +2,31 @@
 Apply pruning, knowledge distillation and quantization to a model
 """ 
 
-# pruner retrain and log everything in wandb
+
 # Imports
 import wandb
-import torch.nn.functional as F
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import torch_pruning as tp
 import os
 import copy
 import random
 import numpy as np
-import torch
-from torch import nn
-from torch.optim import *
-from torch.optim.lr_scheduler import *
+from torch.optim import SGD
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
-from torchvision.datasets import *
-from torchvision.transforms import *
 from tqdm.auto import tqdm
 from functools import partial
-import logging 
+import logging
 from datetime import datetime
 from torch2trt import torch2trt
 from pytorch_bench import get_model_size
-assert torch.cuda.is_available(), "Cuda Not Available!"
 
-# Device
+
+assert torch.cuda.is_available(), "CUDA is not available!"
+
 device = torch.device("cuda")
-
 
 def setup_logging(base_path):
     os.makedirs(base_path, exist_ok=True)
@@ -38,82 +35,41 @@ def setup_logging(base_path):
     logging.info(f"Run ID: {run_id}")
     return run_id
 
-# Evaluation loop
 @torch.no_grad()
-def evaluate(
-    model: nn.Module,
-    dataloader: DataLoader,
-    verbose=True,
-) -> float:
-    """
-    Evaluate the model on the given dataset
-    """
+def evaluate(model: nn.Module, dataloader: DataLoader, verbose=True) -> tuple:
     model.eval()
-
-    num_samples = 0
-    num_correct = 0
-    loss = 0
+    num_samples = num_correct = loss = 0
 
     for inputs, targets in tqdm(dataloader, desc="eval", leave=False, disable=not verbose):
-        # Move the data from CPU to GPU
-        inputs = inputs.to(device)
-        targets = targets.to(device)
-
-        # Inference
+        inputs, targets = inputs.to(device), targets.to(device)
         outputs = model(inputs)
-        # Calculate loss
         loss += F.cross_entropy(outputs, targets, reduction="sum")
-        # Convert logits to class indices
-        outputs = outputs.argmax(dim=1)
-        # Update metrics
         num_samples += targets.size(0)
-        num_correct += (outputs == targets).sum()
+        num_correct += (outputs.argmax(dim=1) == targets).sum()
+
     return (num_correct / num_samples * 100).item(), (loss / num_samples).item()
 
-# training loop
-def train(
-    model: nn.Module,
-    train_loader: DataLoader,
-    test_loader: DataLoader,
-    epochs: int,
-    lr: int,
-    weight_decay=5e-4,
-    callbacks=None,
-    save=None,
-    save_only_state_dict=False,
-) -> None:
-
-    optimizer = torch.optim.SGD(model.parameters(
-    ), lr=lr, momentum=0.9, weight_decay=weight_decay)
-    """
-    Training loop
-    """
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs)
+def train(model: nn.Module, train_loader: DataLoader, test_loader: DataLoader, 
+          epochs: int, lr: float, weight_decay=5e-4, callbacks=None, save=None, 
+          save_only_state_dict=False) -> None:
+    
+    optimizer = SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay)
+    scheduler = CosineAnnealingLR(optimizer, epochs)
     criterion = nn.CrossEntropyLoss()
     best_acc = -1
-    best_checkpoint = dict()
+    best_checkpoint = {}
 
-  
     for epoch in range(epochs):
         model.train()
         for inputs, targets in tqdm(train_loader, leave=False):
-            inputs = inputs.to(device)
-            targets = targets.to(device)
-
-            # Reset the gradients (from the last iteration)
+            inputs, targets = inputs.to(device), targets.to(device)
             optimizer.zero_grad()
-
-            # Forward inference
             outputs = model(inputs)
             loss = criterion(outputs, targets)
-
-            # Backward propagation
             loss.backward()
-
-            # Update optimizer
             optimizer.step()
 
-            if callbacks is not None:
+            if callbacks:
                 for callback in callbacks:
                     callback()
 
@@ -121,23 +77,17 @@ def train(
         logging.info(
             f'Epoch {epoch + 1}/{epochs} | Val acc: {acc:.2f} | Val loss: {val_loss:.4f} | LR: {optimizer.param_groups[0]["lr"]:.6f}')
         
-        
-        # log les valeurs dans wandb
-        if wandb.run is not None:
-            wandb.log({"val_acc": acc, "val_loss": val_loss,
-                    "lr": optimizer.param_groups[0]["lr"]})
+        if wandb.run:
+            wandb.log({"val_acc": acc, "val_loss": val_loss, "lr": optimizer.param_groups[0]["lr"]})
 
-        if best_acc < acc:
+        if acc > best_acc:
             best_checkpoint['state_dict'] = copy.deepcopy(model.state_dict())
             best_acc = acc
-        # Update LR scheduler
         scheduler.step()
+
     model.load_state_dict(best_checkpoint['state_dict'])
     if save:
-        if save_only_state_dict:
-            torch.save(model.state_dict(), save)
-        else:
-            torch.save(model, save)     
+        torch.save(model.state_dict() if save_only_state_dict else model, save)
     logging.info(f'Best val acc: {best_acc:.2f}')
 
 
@@ -145,110 +95,62 @@ def get_pruner(model, example_input, num_classes):
     imp = tp.importance.GroupNormImportance(p=2)
     pruner_entry = partial(tp.pruner.GroupNormPruner, isomorphic=True, global_pruning=True)
 
+    ignored_layers = [m for m in model.modules() if 
+                      (isinstance(m, nn.Linear) and m.out_features == num_classes) or
+                      (isinstance(m, nn.modules.conv._ConvNd) and m.out_channels == num_classes)]
 
-    unwrapped_parameters = []
-    ignored_layers = []
-    ch_sparsity_dict = {}
-    # ignore output layers
-    for m in model.modules():
-        if isinstance(m, torch.nn.Linear) and m.out_features == num_classes:
-            ignored_layers.append(m)
-        elif isinstance(m, torch.nn.modules.conv._ConvNd) and m.out_channels == num_classes:
-            ignored_layers.append(m)
-   
-    pruner = pruner_entry(
+    return pruner_entry(
         model,
         example_input,
         importance=imp,
         iterative_steps=400,
         ch_sparsity=1.0,
-        pruning_ratio_dict=ch_sparsity_dict,
         ignored_layers=ignored_layers,
-        unwrapped_parameters=unwrapped_parameters,
     )
-    return pruner
 
-# pruning jusqu'à atteindre le speed up voulu
-def progressive_pruning_speedup(pruner, model, speed_up, example_inputs):
+def progressive_pruning(pruner, model, target_value, example_inputs, mode='speedup'):
     model.eval()
-    base_ops, _ = tp.utils.count_ops_and_params(
-        model, example_inputs=example_inputs)
-    current_speed_up = 1
-    while current_speed_up < speed_up:
+    base_ops, base_params = tp.utils.count_ops_and_params(model, example_inputs=example_inputs)
+    current_value = 1
+
+    while current_value < target_value:
         pruner.step(interactive=False)
-        pruned_ops, _ = tp.utils.count_ops_and_params(
-            model, example_inputs=example_inputs)
-        current_speed_up = float(base_ops) / pruned_ops
-        # print(current_speed_up)
-    return current_speed_up
+        pruned_ops, pruned_params = tp.utils.count_ops_and_params(model, example_inputs=example_inputs)
+        current_value = float(base_ops) / pruned_ops if mode == 'speedup' else float(base_params) / pruned_params
+
+    return current_value
 
 
-# pruning jusqu'à atteindre le ratio de compression voulu
-def progressive_pruning_compression_ratio(pruner, model, compression_ratio, example_inputs):
-    # compression ratio défini par taille initiale / taille finale
-    model.eval()
-    _, base_params = tp.utils.count_ops_and_params(
-        model, example_inputs=example_inputs)
-    current_compression_ratio = 1
-    while current_compression_ratio < compression_ratio:
-        pruner.step(interactive=False)
-        _, pruned_params = tp.utils.count_ops_and_params(
-            model, example_inputs=example_inputs)
-        current_compression_ratio = float(base_params) / pruned_params
-        # print(current_compression_ratio)
-    return current_compression_ratio
 
-# training loop
-def train_kd(
-    model_student: nn.Module,
-    model_teacher: nn.Module,
-    train_loader: DataLoader,
-    test_loader: DataLoader,
-    epochs: int,
-    lr: int,
-    temperature: int,
-    alpha: float,
-    weight_decay=5e-4,
-    callbacks=None,
-    save=None,
-    save_only_state_dict=False,
-) -> None:
 
-    optimizer = torch.optim.SGD(model_student.parameters(
-    ), lr=lr, momentum=0.9, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs)
+def train_kd(model_student: nn.Module, model_teacher: nn.Module, train_loader: DataLoader, 
+             test_loader: DataLoader, epochs: int, lr: float, temperature: float, alpha: float, 
+             weight_decay=5e-4, callbacks=None, save=None, save_only_state_dict=False) -> None:
+    optimizer = SGD(model_student.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay)
+    scheduler = CosineAnnealingLR(optimizer, epochs)
     criterion = nn.CrossEntropyLoss()
     best_acc = -1
-    best_checkpoint = dict()
+    best_checkpoint = {}
 
-  
     for epoch in range(epochs):
         model_student.train()
-        model_teacher.train()
+        model_teacher.eval()
         for inputs, targets in tqdm(train_loader, leave=False):
-            inputs = inputs.to(device)
-            targets = targets.to(device)
-
-            # Reset the gradients (from the last iteration)
+            inputs, targets = inputs.to(device), targets.to(device)
             optimizer.zero_grad()
-
-            # Forward inference
             out_student = model_student(inputs)
             out_teacher = model_teacher(inputs)
 
-
-            # kd loss
             predict_student = F.log_softmax(out_student / temperature, dim=1)
             predict_teacher = F.softmax(out_teacher / temperature, dim=1)
-            loss = nn.KLDivLoss(reduction="batchmean")(predict_student, predict_teacher) * (alpha * temperature * temperature) + criterion(out_student, targets) * (1-alpha)
+            loss = (nn.KLDivLoss(reduction="batchmean")(predict_student, predict_teacher) * 
+                    (alpha * temperature * temperature) + 
+                    criterion(out_student, targets) * (1-alpha))
             
             loss.backward()
-
-
-            # Update optimizer
             optimizer.step()
 
-            if callbacks is not None:
+            if callbacks:
                 for callback in callbacks:
                     callback()
 
@@ -256,61 +158,40 @@ def train_kd(
         logging.info(
             f'KD - Epoch {epoch + 1}/{epochs} | Val acc: {acc:.2f} | Val loss: {val_loss:.4f} | LR: {optimizer.param_groups[0]["lr"]:.6f}')
 
-        # log les valeurs dans wandb
-        if wandb.run is not None:
-            wandb.log({"val_acc": acc, "val_loss": val_loss,
-                    "lr": optimizer.param_groups[0]["lr"]})
+        if wandb.run:
+            wandb.log({"val_acc": acc, "val_loss": val_loss, "lr": optimizer.param_groups[0]["lr"]})
             
-        if best_acc < acc:
+        if acc > best_acc:
             best_checkpoint['state_dict'] = copy.deepcopy(model_student.state_dict())
             best_acc = acc
-        # Update LR scheduler
         scheduler.step()
+
     model_student.load_state_dict(best_checkpoint['state_dict'])
     if save:
-        # on veut sauvegarder le meilleur modèle
-        if save_only_state_dict:
-            torch.save(model_student.state_dict(), save)
-        else:
-            torch.save(model_student, save)     
-    logging.info(f'Best val acc after KD: {best_acc:.2f}')     
+        torch.save(model_student.state_dict() if save_only_state_dict else model_student, save)
+    logging.info(f'Best val acc after KD: {best_acc:.2f}')
 
-
-
-def get_compression_ratio_and_bitwidth_from_compression_ratio(compression_ratio):
-    if compression_ratio <=2:
+def get_compression_params(compression_ratio):
+    if compression_ratio <= 2:
         return compression_ratio, 32
-    elif  2 < compression_ratio <= 4:
+    elif compression_ratio <= 4:
         return compression_ratio/2, 16
     else:
-        return compression_ratio/4, 8 
-
-
-def get_speed_up_and_bitwidth_from_speed_up(speed_up):
-    if speed_up <= 2:
-        return speed_up, 32
-    elif  2 < speed_up <= 4:
-        return speed_up/2, 16
-    else:
-        return speed_up/4, 8 
+        return compression_ratio/4, 8
 
 
 
-def apply_pruning_and_kd(model: nn.Module, train_loader: DataLoader, test_loader: DataLoader, 
-                         example_input: torch.Tensor, num_classes: int, device: torch.device,
-                         epochs: int = 120, lr: float = 0.01, temperature: float = 4, 
-                         alpha: float = 0.9, compression_ratio: float = None, 
-                         speed_up: float = None, random_seed: int = 42) -> nn.Module:
-    
+
+def apply_pruning_and_kd(model, train_loader, test_loader, example_input, num_classes, 
+                         epochs=120, lr=0.01, temperature=4, alpha=0.9, 
+                         compression_ratio=None, speed_up=None, random_seed=42):
     # Setup
     base_path = "results_experiments"
     run_id = setup_logging(base_path)
     logging.info(f"Model: {model.__class__.__name__}")
     
     # Set random seed
-    random.seed(random_seed)
-    np.random.seed(random_seed)
-    torch.manual_seed(random_seed)
+    set_random_seed(random_seed)
     
     # Prepare models
     model = model.to(device)
@@ -319,144 +200,144 @@ def apply_pruning_and_kd(model: nn.Module, train_loader: DataLoader, test_loader
     
     # Initial evaluation
     start_macs, start_params = tp.utils.count_ops_and_params(model, example_input)
-    start_acc, start_loss = evaluate(model, test_loader, device)
-    logging.info(f'Initial Model: MACs = {start_macs/1e6:.3f}M, Params = {start_params/1e6:.3f}M, Accuracy = {start_acc:.2f}%, Loss = {start_loss:.3f}')
+    start_acc, start_loss = evaluate(model, test_loader)
+    log_model_stats("Initial Model", start_macs, start_params, start_acc, start_loss)
     
     # Pruning
     pruner = get_pruner(model, example_input, num_classes)
-    if compression_ratio:
-        progressive_pruning_compression_ratio(pruner, model, compression_ratio, example_input)
-    elif speed_up:
-        progressive_pruning_speedup(pruner, model, speed_up, example_input)
-    
+    progressive_pruning(pruner, model, compression_ratio, example_input, 
+                        mode='speedup' if speed_up else 'compression')
     # Knowledge Distillation
     logging.info('Starting Knowledge Distillation')
-    model = train_kd(model, model_teacher, train_loader, test_loader, device, epochs, lr, temperature, alpha)
+    model = train_kd(model, model_teacher, train_loader, test_loader, epochs, lr, temperature, alpha,
+                     save=f'{base_path}/{run_id}/kd_model.pth')
     
     # Final evaluation
     end_macs, end_params = tp.utils.count_ops_and_params(model, example_input)
-    end_acc, end_loss = evaluate(model, test_loader, device)
-    logging.info(f'Final Model: MACs = {end_macs/1e6:.3f}M, Params = {end_params/1e6:.3f}M, Accuracy = {end_acc:.2f}%, Loss = {end_loss:.3f}')
+    end_acc, end_loss = evaluate(model, test_loader)
+    log_model_stats("Final Model", end_macs, end_params, end_acc, end_loss)
     
     # Save model
     torch.save(model.state_dict(), f'{base_path}/{run_id}/final_model.pth')
     
-    return model
+    return model, end_macs, end_params, end_acc, end_loss
 
-
-def optimize(model, 
-            traindataloader,
-            testdataloader, 
-            example_input, 
-            num_classes,
-            epochs=120,
-            lr=0.01,
-            temperature=4,
-            alpha=0.9, 
-            compression_ratio=2, 
-            speed_up=None, 
-            bitwidth=16, 
-            wandb_project=None, 
-            random_seed=42):
-    # on  veut log tous les résultats intermédiaires (modèle régularizé/modèle pruné) dans un dossier results
-    if not os.path.exists("results_experiments"):
-        os.makedirs("results_experiments")
-    # subfolder for each run
-    run_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    os.makedirs(f"results_experiments/{run_id}")
-    base_path = f"results_experiments/{run_id}"
-    # logging
-    logging.basicConfig(filename=f"{base_path}/log.txt", level=logging.INFO)
-    logging.info(f"Run ID: {run_id}")
-    logging.info(f"Model: {model.__class__.__name__}")
-
-    example_input = example_input.to(device)
-    
-    if wandb_project:
-        run = wandb.init(project=wandb_project)
-        logging.info("Wandb initialized")
-        logging.info(f"Wandb project: {wandb_project}")
-        
-
-    # Fixer le seed pour la reproductibilité
-    random.seed(random_seed)
-    np.random.seed(random_seed)
-    torch.manual_seed(random_seed)
-
-    # Copy the initial model for KD 
-    model_teacher = copy.deepcopy(model)
-
-    # Avant pruning
-    start_macs, start_params = tp.utils.count_ops_and_params(model, example_input)
-    start_acc, start_loss = evaluate(model, testdataloader)
-    logging.info(' ----- Initial Model: -----')
-    logging.info(f'Number of MACs = {start_macs/1e6:.3f} M')
-    logging.info(f'Number of Parameters = {start_params/1e6:.3f} M')
-    logging.info(f'Accuracy = {start_acc:.2f} %')
-    logging.info(f'Loss = {start_loss:.3f}')
-    logging.info(' ---------------------------')
-    if wandb_project:
-        wandb.run.summary["start_macs (M)"] = f'{start_macs/1e6:.3f}'
-        wandb.run.summary["start_params (M)"] = f'{start_params/1e6:.3f}'
-        wandb.run.summary["start_acc (%)"] = f'{start_acc:.2f}'
-        wandb.run.summary["start_loss"] = f'{start_loss:.3f}'
-
-    if compression_ratio:
-        compression_ratio, bitwidth = get_compression_ratio_and_bitwidth_from_compression_ratio(compression_ratio)
-    if speed_up:
-        speed_up, bitwidth = get_speed_up_and_bitwidth_from_speed_up(speed_up)
-
-    pruner = get_pruner(model, example_input, num_classes)
-
-    logging.info('----- Pruning -----')
-    if compression_ratio:
-        progressive_pruning_compression_ratio(pruner, model, compression_ratio, example_input)
-    else:
-        progressive_pruning_speedup(pruner, model, speed_up, example_input)
-
-    # Fine tuning
-    logging.info('----- Fine tuning with KD -----')
-    train_kd(model, model_teacher, traindataloader, testdataloader, epochs=epochs, lr=lr, temperature=temperature, alpha=alpha,save=f'{base_path}/kd_model.pth')
-    
-    # Post fine tuning
-    end_macs, end_params = tp.utils.count_ops_and_params(model, example_input)
-    end_acc, end_loss = evaluate(model, testdataloader)
-    logging.info('----- Results after fine tuning -----')
-    logging.info(f'Number of Parameters: {start_params/1e6:.2f} M => {end_params/1e6:.2f} M')
-    logging.info(f'MACs: {start_macs/1e6:.2f} M => {end_macs/1e6:.2f} M')
-    logging.info(f'Accuracy: {start_acc:.2f} % => {end_acc:.2f} %')
-    logging.info(f'Loss: {start_loss:.2f} => {end_loss:.2f}')
-    if wandb_project:
-        # log les valeurs dans wandb
-        wandb.run.summary["best_acc"] = end_acc
-        wandb.run.summary["best_loss"] = end_loss
-        wandb.run.summary["end macs (M)"] = end_macs/1e6
-        wandb.run.summary["end num_params (M)"] = end_params/1e6
-        wandb.run.summary["size (MB)"] = get_model_size(model)/8e6
-
-    # Quantization part 
+def apply_quantization(model, example_input, train_loader, bitwidth=16):
     logging.info('----- Quantization -----')
-    # free cache memory 
     torch.cuda.empty_cache()
-    # if user want to choose the bitwidth
+    
     if bitwidth == 8:
         logging.info('Calibrating on train dataset...')
-        calib_dataset = list()
-        for i, img in enumerate(traindataloader):
-            calib_dataset.extend(img[0])
-            if i == 2000:
-                break
-        model_trt = torch2trt(model,[example_input], fp16_mode=True, int8_mode=True, int8_calib_dataset=calib_dataset, max_batch_size=128)
+        calib_dataset = get_calibration_dataset(train_loader)
+        model_trt = torch2trt(model, [example_input], fp16_mode=True, int8_mode=True, 
+                              int8_calib_dataset=calib_dataset, max_batch_size=128)
         compression_ratio_quant = 4
     elif bitwidth == 16:
-        model_trt = torch2trt(model,[example_input], fp16_mode=True, max_batch_size=128)
+        model_trt = torch2trt(model, [example_input], fp16_mode=True, max_batch_size=128)
         compression_ratio_quant = 2
-    else: # run with fp32 if not quantization -> speed up from tensorrt inference engine
-        model_trt = torch2trt(model,[example_input], max_batch_size=128)
+    else:
+        model_trt = torch2trt(model, [example_input], max_batch_size=128)
         bitwidth = 32
         compression_ratio_quant = 1
-    logging.info(f"Final Compression Ratio: {start_params/end_params*compression_ratio_quant:.2f}") 
+    
     logging.info(f"Bit width: {bitwidth}")
+    return model_trt, compression_ratio_quant
+
+def optimize(model, train_loader, test_loader, example_input, num_classes,
+             epochs=120, lr=0.01, temperature=4, alpha=0.9, 
+             compression_ratio=2, speed_up=None, bitwidth=16, 
+             wandb_project=None, random_seed=42):
+    
+    # Setup
+    base_path = setup_experiment_folder()
+    setup_logging(base_path)
+    setup_wandb(wandb_project)
+    
+    # Initial model evaluation
+    start_macs, start_params = tp.utils.count_ops_and_params(model, example_input)
+    start_acc, start_loss = evaluate(model, test_loader)
+    log_model_stats("Initial Model", start_macs, start_params, start_acc, start_loss)
+    
+    # Determine pruning strategy and quantization bitwidth
+    compression_ratio, speed_up, bitwidth = determine_optimization_strategy(compression_ratio, speed_up)
+    
+    # Apply pruning and knowledge distillation
+    model, end_macs, end_params, end_acc, end_loss = apply_pruning_and_kd(
+        model, train_loader, test_loader, example_input, num_classes,
+        epochs, lr, temperature, alpha, compression_ratio, speed_up, random_seed
+    )
+    
+    # Apply quantization
+    model_trt, compression_ratio_quant = apply_quantization(model, example_input, train_loader, bitwidth)
+    
+    # Log final results
+    final_compression_ratio = (start_params / end_params) * compression_ratio_quant
+    logging.info(f"Final Compression Ratio: {final_compression_ratio:.2f}")
+    
+    # Save final model
     torch.save(model_trt.state_dict(), f'{base_path}/model_trt.pth')
     
+    # Log results to wandb if enabled
+    if wandb_project:
+        log_wandb_results(start_macs, start_params, start_acc, start_loss,
+                          end_macs, end_params, end_acc, end_loss,
+                          final_compression_ratio, bitwidth)
+    
     return model_trt
+
+# Helper functions
+def setup_experiment_folder():
+    base_path = f"results_experiments/{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+    os.makedirs(base_path, exist_ok=True)
+    return base_path
+
+def setup_logging(base_path):
+    logging.basicConfig(filename=f"{base_path}/log.txt", level=logging.INFO)
+    logging.info(f"Run ID: {os.path.basename(base_path)}")
+
+def setup_wandb(wandb_project):
+    if wandb_project:
+        wandb.init(project=wandb_project)
+        logging.info(f"Wandb initialized. Project: {wandb_project}")
+
+def set_random_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+def log_model_stats(stage, macs, params, acc, loss):
+    logging.info(f' ----- {stage}: -----')
+    logging.info(f'Number of MACs = {macs/1e6:.3f} M')
+    logging.info(f'Number of Parameters = {params/1e6:.3f} M')
+    logging.info(f'Accuracy = {acc:.2f} %')
+    logging.info(f'Loss = {loss:.3f}')
+    logging.info(' ---------------------------')
+
+def determine_optimization_strategy(compression_ratio, speed_up):
+    compression_ratio, bitwidth = get_compression_params(compression_ratio or speed_up)
+    return compression_ratio, speed_up, bitwidth
+
+def get_calibration_dataset(train_loader):
+    calib_dataset = []
+    for i, (img, _) in enumerate(train_loader):
+        calib_dataset.extend(img)
+        if i == 2000:
+            break
+    return calib_dataset
+
+def log_wandb_results(start_macs, start_params, start_acc, start_loss,
+                      end_macs, end_params, end_acc, end_loss,
+                      final_compression_ratio, bitwidth):
+    wandb.run.summary.update({
+        "start_macs (M)": f'{start_macs/1e6:.3f}',
+        "start_params (M)": f'{start_params/1e6:.3f}',
+        "start_acc (%)": f'{start_acc:.2f}',
+        "start_loss": f'{start_loss:.3f}',
+        "end_macs (M)": end_macs/1e6,
+        "end_params (M)": end_params/1e6,
+        "best_acc": end_acc,
+        "best_loss": end_loss,
+        "final_compression_ratio": final_compression_ratio,
+        "bitwidth": bitwidth,
+        "size (MB)": get_model_size(model)/8e6
+    })
