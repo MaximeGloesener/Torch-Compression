@@ -30,6 +30,14 @@ assert torch.cuda.is_available(), "Cuda Not Available!"
 # Device
 device = torch.device("cuda")
 
+
+def setup_logging(base_path):
+    os.makedirs(base_path, exist_ok=True)
+    logging.basicConfig(filename=f"{base_path}/log.txt", level=logging.INFO)
+    run_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    logging.info(f"Run ID: {run_id}")
+    return run_id
+
 # Evaluation loop
 @torch.no_grad()
 def evaluate(
@@ -279,13 +287,61 @@ def get_compression_ratio_and_bitwidth_from_compression_ratio(compression_ratio)
 
 
 def get_speed_up_and_bitwidth_from_speed_up(speed_up):
-    if speed_up <=2:
+    if speed_up <= 2:
         return speed_up, 32
     elif  2 < speed_up <= 4:
         return speed_up/2, 16
     else:
         return speed_up/4, 8 
 
+
+
+def apply_pruning_and_kd(model: nn.Module, train_loader: DataLoader, test_loader: DataLoader, 
+                         example_input: torch.Tensor, num_classes: int, device: torch.device,
+                         epochs: int = 120, lr: float = 0.01, temperature: float = 4, 
+                         alpha: float = 0.9, compression_ratio: float = None, 
+                         speed_up: float = None, random_seed: int = 42) -> nn.Module:
+    
+    # Setup
+    base_path = "results_experiments"
+    run_id = setup_logging(base_path)
+    logging.info(f"Model: {model.__class__.__name__}")
+    
+    # Set random seed
+    random.seed(random_seed)
+    np.random.seed(random_seed)
+    torch.manual_seed(random_seed)
+    
+    # Prepare models
+    model = model.to(device)
+    example_input = example_input.to(device)
+    model_teacher = copy.deepcopy(model)
+    
+    # Initial evaluation
+    start_macs, start_params = tp.utils.count_ops_and_params(model, example_input)
+    start_acc, start_loss = evaluate(model, test_loader, device)
+    logging.info(f'Initial Model: MACs = {start_macs/1e6:.3f}M, Params = {start_params/1e6:.3f}M, Accuracy = {start_acc:.2f}%, Loss = {start_loss:.3f}')
+    
+    # Pruning
+    pruner = get_pruner(model, example_input, num_classes)
+    if compression_ratio:
+        progressive_pruning_compression_ratio(pruner, model, compression_ratio, example_input)
+    elif speed_up:
+        progressive_pruning_speedup(pruner, model, speed_up, example_input)
+    
+    # Knowledge Distillation
+    logging.info('Starting Knowledge Distillation')
+    model = train_kd(model, model_teacher, train_loader, test_loader, device, epochs, lr, temperature, alpha)
+    
+    # Final evaluation
+    end_macs, end_params = tp.utils.count_ops_and_params(model, example_input)
+    end_acc, end_loss = evaluate(model, test_loader, device)
+    logging.info(f'Final Model: MACs = {end_macs/1e6:.3f}M, Params = {end_params/1e6:.3f}M, Accuracy = {end_acc:.2f}%, Loss = {end_loss:.3f}')
+    
+    # Save model
+    torch.save(model.state_dict(), f'{base_path}/{run_id}/final_model.pth')
+    
+    return model
 
 
 def optimize(model, 
@@ -299,7 +355,7 @@ def optimize(model,
             alpha=0.9, 
             compression_ratio=2, 
             speed_up=None, 
-            bitwidth=8, 
+            bitwidth=16, 
             wandb_project=None, 
             random_seed=42):
     # on  veut log tous les résultats intermédiaires (modèle régularizé/modèle pruné) dans un dossier results
